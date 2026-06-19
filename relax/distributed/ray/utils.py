@@ -1,10 +1,11 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
 # Adapted from https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ray/utils.py#L1
 import os
 
 import ray
-import torch
 
 from relax.distributed.ray.ray_actor import RayActor
+from relax.utils import device as device_utils
 
 
 # Refer to
@@ -17,6 +18,7 @@ from relax.distributed.ray.ray_actor import RayActor
 # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/intel_gpu.py#L97-L98
 NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = [
     "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+    "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES",
     "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
     "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES",
     "RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES",
@@ -31,8 +33,8 @@ def ray_noset_visible_devices(env_vars=os.environ):
 
 
 def get_physical_gpu_id():
-    device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
+    device = device_utils.current_device()
+    props = device_utils.get_device_properties(device)
     return str(props.uuid)
 
 

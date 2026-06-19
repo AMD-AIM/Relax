@@ -1,10 +1,17 @@
+# Copyright (c) 2026 Relax Authors. All Rights Reserved.
+
 import os
+import time
+import socket
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import timedelta
+from typing import Any
 
 import torch
 import torch.distributed as dist
 
+from relax.utils import device as device_utils
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import available_memory, clear_memory, print_memory
 
@@ -68,10 +75,16 @@ def monkey_patch_torch_dist(args=None):
         """Wrap communication functions with memory check."""
 
         def new_function(*args, **kwargs):
-            args = tuple([arg.group if isinstance(arg, ReloadableProcessGroup) else arg for arg in args])
+            original_args = args
+            original_kwargs = kwargs
+            args = tuple(arg.group if isinstance(arg, ReloadableProcessGroup) else arg for arg in args)
             kwargs = {k: (v.group if isinstance(v, ReloadableProcessGroup) else v) for k, v in kwargs.items()}
             with _wrap_low_level_call():
-                return func(*args, **kwargs)
+                try:
+                    return func(*args, **kwargs)
+                except Exception as exc:
+                    _log_distributed_exception(func.__name__, original_args, original_kwargs, exc)
+                    raise
 
         return new_function
 
@@ -149,13 +162,15 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
         return getattr(self.group, name)
 
     @staticmethod
-    def destroy_process_groups():
+    def destroy_process_groups(post_destroy_delay: float = 2.0):
         pid = os.getpid()
+        destroyed_count = 0
         for reloadable_group in ReloadableProcessGroup.GROUPS.get(pid, []):
             if reloadable_group.group is None:
                 continue
             try:
                 dist.destroy_process_group(reloadable_group.group)
+                destroyed_count += 1
             except ValueError as e:
                 logger.warning(
                     f"Process group already invalid/destroyed; skipping cleanup. Exception: {e}",
@@ -165,21 +180,52 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
             del reloadable_group.group
             reloadable_group.group = None
 
+        if destroyed_count > 0 and post_destroy_delay > 0:
+            # Wait for OS to release NCCL socket ports (TCP TIME_WAIT),
+            # preventing "Address already in use" on subsequent reload.
+            logger.info(
+                f"Destroyed {destroyed_count} process groups, waiting {post_destroy_delay}s "
+                "for NCCL socket port release"
+            )
+            time.sleep(post_destroy_delay)
+
     @staticmethod
-    def reload_process_groups(timeout_minutes: int = 30):
+    def reload_process_groups(timeout_minutes: int = 30, max_retries: int = 3, retry_delay: float = 5.0):
         pid = os.getpid()
         reloadable_groups = ReloadableProcessGroup.GROUPS.get(pid, [])
         logger.info(f"Reloading {len(reloadable_groups)} process groups in pid {pid}")
         old_new_group = old_new_group_dict.get(pid)
-        for reloadable_group in reloadable_groups:
+        for idx, reloadable_group in enumerate(reloadable_groups):
             if reloadable_group.group is not None:
                 continue
-            group = old_new_group(
-                ranks=reloadable_group.group_info["ranks"],
-                backend="nccl",
-                timeout=timedelta(minutes=timeout_minutes),
-            )
-            reloadable_group.group = group
+            last_error = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    group = old_new_group(
+                        ranks=reloadable_group.group_info["ranks"],
+                        backend=device_utils.get_dist_backend(),
+                        timeout=timedelta(minutes=timeout_minutes),
+                    )
+                    reloadable_group.group = group
+                    if attempt > 1:
+                        logger.info(f"Process group {idx} reloaded successfully on attempt {attempt}")
+                    last_error = None
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        f"Failed to reload process group {idx} (attempt {attempt}/{max_retries}): {e}",
+                        exc_info=(attempt == max_retries),
+                    )
+                    if attempt < max_retries:
+                        sleep_time = retry_delay * attempt
+                        logger.info(f"Retrying in {sleep_time}s...")
+                        time.sleep(sleep_time)
+            if last_error is not None:
+                raise RuntimeError(
+                    f"Failed to reload process group {idx} after {max_retries} attempts "
+                    f"(ranks={reloadable_group.group_info['ranks']})"
+                ) from last_error
 
     def rank(self) -> int:
         return self.group.rank()
@@ -203,7 +249,11 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
         if inner is None:
             raise RuntimeError("ReloadableProcessGroup: inner PG is None, call reload() first.")
         with _wrap_low_level_call():
-            return getattr(inner, method)(*args, **kwargs)
+            try:
+                return getattr(inner, method)(*args, **kwargs)
+            except Exception as exc:
+                _log_distributed_exception(method, (self, *args), kwargs, exc)
+                raise
 
     def _fwd_query(self, method, *args, **kwargs):
         """Forward non-communication calls without memory check."""
@@ -293,14 +343,16 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
         self.group.bound_device_id = dev
 
 
-def destroy_process_groups():
+def destroy_process_groups(post_destroy_delay: float = 2.0):
     """Destroy all reloadable process groups."""
-    ReloadableProcessGroup.destroy_process_groups()
+    ReloadableProcessGroup.destroy_process_groups(post_destroy_delay=post_destroy_delay)
 
 
-def reload_process_groups(timeout_minutes: int = 30):
+def reload_process_groups(timeout_minutes: int = 30, max_retries: int = 3, retry_delay: float = 5.0):
     """Reload all reloadable process groups."""
-    ReloadableProcessGroup.reload_process_groups(timeout_minutes=timeout_minutes)
+    ReloadableProcessGroup.reload_process_groups(
+        timeout_minutes=timeout_minutes, max_retries=max_retries, retry_delay=retry_delay
+    )
 
 
 @contextmanager
